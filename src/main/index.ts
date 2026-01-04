@@ -2,10 +2,17 @@ import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { BleService } from './ble'
+
+// Store main window reference
+let mainWindow: BrowserWindow | null = null
+
+// BLE service singleton instance (will be initialized after app is ready)
+let bleService: BleService | null = null
 
 function createWindow(): void {
   // Create the browser window.
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 900,
     height: 670,
     show: false,
@@ -17,8 +24,11 @@ function createWindow(): void {
     }
   })
 
+  // Set main window reference in BLE service
+  bleService?.setMainWindow(mainWindow)
+
   mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
+    mainWindow!.show()
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -33,6 +43,21 @@ function createWindow(): void {
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
+}
+
+// Setup IPC handlers for BLE operations
+function setupBleIpcHandlers(): void {
+  ipcMain.handle('ble:get-state', () => {
+    return bleService?.getState() ?? 'unknown'
+  })
+
+  ipcMain.handle('ble:start-scan', async () => {
+    return bleService?.startScan() ?? { success: false, error: 'BLE service not initialized' }
+  })
+
+  ipcMain.handle('ble:stop-scan', async () => {
+    return bleService?.stopScan() ?? { success: false }
+  })
 }
 
 // This method will be called when Electron has finished
@@ -52,6 +77,12 @@ app.whenReady().then(() => {
   // IPC test
   ipcMain.on('ping', () => console.log('pong'))
 
+  // Initialize BLE service singleton after app is ready
+  bleService = new BleService()
+
+  // Setup BLE IPC handlers
+  setupBleIpcHandlers()
+
   createWindow()
 
   app.on('activate', function () {
@@ -66,8 +97,14 @@ app.whenReady().then(() => {
 // explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
+    bleService?.cleanup()
     app.quit()
   }
+})
+
+// Cleanup BLE on app quit
+app.on('before-quit', () => {
+  bleService?.cleanup()
 })
 
 // In this file you can include the rest of your app's specific main process
