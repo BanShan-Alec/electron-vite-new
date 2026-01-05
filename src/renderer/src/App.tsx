@@ -6,6 +6,11 @@ function App(): React.JSX.Element {
   const [isScanning, setIsScanning] = useState(false)
   const [devices, setDevices] = useState<Map<string, BleDevice>>(new Map())
   const [error, setError] = useState<string | null>(null)
+  const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
+  const [isGettingBattery, setIsGettingBattery] = useState(false)
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null)
+  const [connectedDeviceId, setConnectedDeviceId] = useState<string | null>(null)
+  const [isDisconnecting, setIsDisconnecting] = useState(false)
 
   // Initialize and setup listeners
   useEffect(() => {
@@ -29,9 +34,41 @@ function App(): React.JSX.Element {
       })
     })
 
+    // Listen for devices that disappeared (no longer advertising)
+    const removeDeviceLostListener = window.ble.onDeviceLost((event) => {
+      setDevices((prev) => {
+        const newMap = new Map(prev)
+        const lostDevice = newMap.get(event.deviceId)
+        if (lostDevice) {
+          console.log(`Device lost: ${lostDevice.name}`)
+        }
+        newMap.delete(event.deviceId)
+        return newMap
+      })
+    })
+
+    // Listen for connection state changes (including auto-disconnect)
+    const removeConnectionListener = window.ble.onConnectionStateChange((state) => {
+      setConnectedDeviceId(state.connected ? state.deviceId : null)
+      if (!state.connected) {
+        setBatteryLevel(null)
+        // Show message if device disconnected automatically (has reason)
+        if (state.reason) {
+          setError(`Device disconnected: ${state.reason}`)
+        }
+      } else {
+        setError(null) // Clear error on successful connection
+      }
+    })
+
+    // Get initial connected device
+    window.ble.getConnectedDeviceId().then(setConnectedDeviceId)
+
     return () => {
       removeStateListener()
       removeDeviceListener()
+      removeDeviceLostListener()
+      removeConnectionListener()
     }
   }, [])
 
@@ -49,6 +86,47 @@ function App(): React.JSX.Element {
   const handleStopScan = useCallback(async () => {
     await window.ble.stopScan()
     setIsScanning(false)
+  }, [])
+
+  // Connect and get battery level for a specific device
+  const handleConnectAndGetBattery = useCallback(async (deviceId: string) => {
+    setError(null)
+    setIsGettingBattery(true)
+    setSelectedDeviceId(deviceId)
+    setBatteryLevel(null)
+
+    try {
+      const result = await window.ble.connectAndGetBattery(deviceId)
+      if (result.success && result.level !== undefined) {
+        setBatteryLevel(result.level)
+      } else {
+        setError(result.error || 'Failed to connect and get battery level')
+      }
+    } catch (err) {
+      setError(String(err))
+    } finally {
+      setIsGettingBattery(false)
+    }
+  }, [])
+
+  // Disconnect from current device
+  const handleDisconnect = useCallback(async () => {
+    setError(null)
+    setIsDisconnecting(true)
+
+    try {
+      const result = await window.ble.disconnect()
+      if (result.success) {
+        setBatteryLevel(null)
+        setSelectedDeviceId(null)
+      } else {
+        setError(result.error || 'Failed to disconnect')
+      }
+    } catch (err) {
+      setError(String(err))
+    } finally {
+      setIsDisconnecting(false)
+    }
   }, [])
 
   const getStateColor = (state: string): string => {
@@ -105,20 +183,60 @@ function App(): React.JSX.Element {
 
       <main className="main-content">
         <div className="controls">
-          <button
-            className={`scan-button ${isScanning ? 'scanning' : ''}`}
-            onClick={isScanning ? handleStopScan : handleStartScan}
-            disabled={bleState !== 'poweredOn'}
-          >
-            {isScanning ? (
-              <>
-                <span className="spinner"></span>
-                Stop Scanning
-              </>
-            ) : (
-              'Start Scan'
-            )}
-          </button>
+          <div className="button-group">
+            <button
+              className={`scan-button ${isScanning ? 'scanning' : ''}`}
+              onClick={isScanning ? handleStopScan : handleStartScan}
+              disabled={bleState !== 'poweredOn'}
+            >
+              {isScanning ? (
+                <>
+                  <span className="spinner"></span>
+                  Stop Scanning
+                </>
+              ) : (
+                'Start Scan'
+              )}
+            </button>
+            <button
+              className={`disconnect-button ${isDisconnecting ? 'loading' : ''}`}
+              onClick={handleDisconnect}
+              disabled={!connectedDeviceId || isDisconnecting}
+            >
+              {isDisconnecting ? (
+                <>
+                  <span className="spinner"></span>
+                  Disconnecting...
+                </>
+              ) : (
+                '🔌 Disconnect'
+              )}
+            </button>
+          </div>
+
+          {connectedDeviceId && (
+            <div className="connection-status">
+              <span className="connection-dot"></span>
+              <span>Connected to: {devices.get(connectedDeviceId)?.name || connectedDeviceId}</span>
+            </div>
+          )}
+
+          {batteryLevel !== null && (
+            <div className="battery-display">
+              <div className="battery-icon">
+                <div
+                  className="battery-fill"
+                  style={{
+                    width: `${batteryLevel}%`,
+                    backgroundColor:
+                      batteryLevel > 50 ? '#4ade80' : batteryLevel > 20 ? '#fbbf24' : '#f87171'
+                  }}
+                ></div>
+              </div>
+              <span className="battery-text">{batteryLevel}%</span>
+            </div>
+          )}
+
           {error && <p className="error-message">{error}</p>}
         </div>
 
@@ -140,19 +258,44 @@ function App(): React.JSX.Element {
             <ul className="device-list">
               {sortedDevices.map((device) => {
                 const rssiInfo = getRssiStrength(device.rssi)
+                const isSp51a = device.name.toLowerCase().includes('sp51a')
+                const isSelected = selectedDeviceId === device.id
                 return (
-                  <li key={device.id} className="device-item">
+                  <li key={device.id} className={`device-item ${isSp51a ? 'sp51a-device' : ''}`}>
                     <div className="device-info">
-                      <span className="device-name">{device.name}</span>
+                      <span className="device-name">
+                        {device.name}
+                        {isSp51a && <span className="sp51a-badge">SP51A</span>}
+                      </span>
                       <span className="device-address">{device.address}</span>
                     </div>
-                    <div className="device-meta">
-                      <span className="device-rssi" style={{ color: rssiInfo.color }}>
-                        {device.rssi} dBm
-                      </span>
-                      <span className="rssi-label" style={{ color: rssiInfo.color }}>
-                        {rssiInfo.label}
-                      </span>
+                    <div className="device-actions">
+                      <div className="device-meta">
+                        <span className="device-rssi" style={{ color: rssiInfo.color }}>
+                          {device.rssi} dBm
+                        </span>
+                        <span className="rssi-label" style={{ color: rssiInfo.color }}>
+                          {rssiInfo.label}
+                        </span>
+                      </div>
+                      {device.connectable && (
+                        <button
+                          className={`get-battery-btn ${connectedDeviceId === device.id ? 'connected' : ''}`}
+                          onClick={() => handleConnectAndGetBattery(device.id)}
+                          disabled={isGettingBattery}
+                          title={
+                            connectedDeviceId === device.id
+                              ? 'Refresh battery'
+                              : 'Connect & get battery'
+                          }
+                        >
+                          {isGettingBattery && isSelected
+                            ? '...'
+                            : connectedDeviceId === device.id
+                              ? '🔄'
+                              : '🔋'}
+                        </button>
+                      )}
                     </div>
                   </li>
                 )

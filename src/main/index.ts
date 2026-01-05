@@ -58,6 +58,28 @@ function setupBleIpcHandlers(): void {
   ipcMain.handle('ble:stop-scan', async () => {
     return bleService?.stopScan() ?? { success: false }
   })
+
+  ipcMain.handle('ble:connect-and-get-battery', async (_event, deviceId: string) => {
+    return (
+      bleService?.connectAndGetBattery(deviceId) ?? {
+        success: false,
+        error: 'BLE service not initialized'
+      }
+    )
+  })
+
+  ipcMain.handle('ble:disconnect', async () => {
+    return (
+      bleService?.disconnect() ?? {
+        success: false,
+        error: 'BLE service not initialized'
+      }
+    )
+  })
+
+  ipcMain.handle('ble:get-connected-device-id', () => {
+    return bleService?.getConnectedDeviceId() ?? null
+  })
 }
 
 // This method will be called when Electron has finished
