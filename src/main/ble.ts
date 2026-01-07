@@ -1,27 +1,41 @@
 import { BrowserWindow } from 'electron'
 import noble, { Peripheral } from '@stoprocent/noble'
 import type { BleDevice, BatteryResult } from '../share/interface'
+import { BleDeviceFSM, Sp51aDeviceFSM, BleDeviceState } from './fsm'
 
-// Standard BLE UUIDs for Battery Service
-const BATTERY_SERVICE_UUID = '180f'
-const BATTERY_LEVEL_CHARACTERISTIC_UUID = '2a19'
-
-// Device disappear timeout (ms) - if no advertisement received within this time, consider device lost
+// Device disappear timeout (ms)
 const DEVICE_LOST_TIMEOUT = 5000
 // Check interval for device presence (ms)
 const DEVICE_CHECK_INTERVAL = 1000
 
-// BLE Service - singleton pattern
+/**
+ * Factory function to create device-specific FSM
+ */
+function createDeviceFSM(peripheral: Peripheral): BleDeviceFSM | undefined {
+  const name = peripheral.advertisement.localName?.toLowerCase() || ''
+
+  // Create SP51A specific FSM for SP51A devices
+  if (name.includes('sp51')) {
+    console.log(`[BLE] Creating Sp51aDeviceFSM for ${peripheral.advertisement.localName}`)
+    return new Sp51aDeviceFSM(peripheral.id)
+  }
+  return undefined
+}
+
+/**
+ * BLE Service - manages device discovery and connection using FSM
+ */
 export class BleService {
   private isScanning = false
   private mainWindow: BrowserWindow | null = null
-  private discoveredPeripherals: Map<string, Peripheral> = new Map()
-  private connectedPeripheral: Peripheral | null = null
-  private connectedDeviceId: string | null = null
-  private disconnectHandler: ((reason: string) => void) | null = null
 
-  // Track when each device was last seen (for detecting disappeared devices)
-  private deviceLastSeen: Map<string, number> = new Map()
+  // Device FSM instances (one per device)
+  private deviceFSMs: Map<string, BleDeviceFSM> = new Map()
+
+  // Currently active/connected device
+  private activeDeviceId: string | null = null
+
+  // Device presence check timer
   private deviceCheckTimer: NodeJS.Timeout | null = null
 
   constructor() {
@@ -33,72 +47,95 @@ export class BleService {
   }
 
   private setupNobleListeners(): void {
-    // 监听蓝牙是否开启
+    // Listen for Bluetooth state changes
     noble.on('stateChange', (state: string) => {
-      console.log('BLE state changed:', state)
+      console.log('[BLE] Bluetooth state changed:', state)
       this.sendToRenderer('ble:state-change', state)
 
       if (state !== 'poweredOn' && this.isScanning) {
         this.isScanning = false
+        this.stopDevicePresenceCheck()
       }
     })
 
-    noble.on('discover', (peripheral) => {
-      const device: BleDevice = {
-        id: peripheral.id,
-        name: peripheral.advertisement.localName || 'Unknown Device',
-        address: peripheral.address || 'Unknown',
-        rssi: peripheral.rssi,
-        connectable: true
-      }
-
-      // Store peripheral reference for later connection
-      this.discoveredPeripherals.set(peripheral.id, peripheral)
-
-      // Update last seen timestamp for device presence tracking
-      this.deviceLastSeen.set(peripheral.id, Date.now())
-
-      console.log('Discovered device:', device.name, device.address)
-      if (device.name.toLocaleLowerCase().includes('sp51')) {
-        console.log('SP51 device found:', device)
-      }
-      this.sendToRenderer('ble:device-found', device)
+    // Listen for device discovery
+    noble.on('discover', async (peripheral) => {
+      await this.handleDeviceDiscovered(peripheral)
     })
   }
 
-  // Start checking for disappeared devices
-  private startDevicePresenceCheck(): void {
-    if (this.deviceCheckTimer) {
-      return // Already running
+  /**
+   * Handle device discovered event
+   */
+  private async handleDeviceDiscovered(peripheral: Peripheral): Promise<void> {
+    const deviceId = peripheral.id
+
+    // Get or create FSM for this device
+    let fsm = this.deviceFSMs.get(deviceId)
+
+    if (!fsm) {
+      // Create new FSM based on device type
+      fsm = createDeviceFSM(peripheral)
+      if (!fsm) {
+        return
+      }
+      // Subscribe to state changes
+      fsm.subscribe((prevState, newState, event, ctx) => {
+        this.handleFSMStateChange(deviceId, prevState, newState, event, ctx)
+      })
+
+      this.deviceFSMs.set(deviceId, fsm)
     }
 
-    this.deviceCheckTimer = setInterval(() => {
-      const now = Date.now()
+    // Send discover event to FSM
+    await fsm.discover(peripheral)
 
-      for (const [deviceId, lastSeen] of this.deviceLastSeen) {
-        if (now - lastSeen > DEVICE_LOST_TIMEOUT) {
-          // Device hasn't been seen for too long - consider it lost
-          console.log(`Device lost: ${deviceId}`)
-
-          // Remove from tracking
-          this.deviceLastSeen.delete(deviceId)
-          this.discoveredPeripherals.delete(deviceId)
-
-          // Notify renderer that device disappeared
-          this.sendToRenderer('ble:device-lost', { deviceId })
-        }
-      }
-    }, DEVICE_CHECK_INTERVAL)
-
-    console.log('Device presence check started')
+    // Notify renderer about device
+    const device: BleDevice = {
+      id: peripheral.id,
+      name: peripheral.advertisement.localName || 'Unknown Device',
+      address: peripheral.address || 'Unknown',
+      rssi: peripheral.rssi,
+      connectable: true
+    }
+    this.sendToRenderer('ble:device-found', device)
   }
 
-  // Stop checking for disappeared devices
-  private stopDevicePresenceCheck(): void {
-    if (this.deviceCheckTimer) {
-      clearInterval(this.deviceCheckTimer)
-      this.deviceCheckTimer = null
-      console.log('Device presence check stopped')
+  /**
+   * Handle FSM state changes
+   */
+  private handleFSMStateChange(
+    deviceId: string,
+    prevState: BleDeviceState,
+    newState: BleDeviceState,
+    _event: string,
+    ctx: ReturnType<BleDeviceFSM['getContext']>
+  ): void {
+    console.log(`[BLE] Device ${deviceId}: ${prevState} -> ${newState}`)
+
+    // Notify renderer about connection state changes
+    if (newState === 'connected') {
+      this.activeDeviceId = deviceId
+      this.sendToRenderer('ble:connection-state', {
+        connected: true,
+        deviceId,
+        deviceName: ctx.deviceName
+      })
+    } else if (prevState === 'connected') {
+      if (this.activeDeviceId === deviceId) {
+        this.activeDeviceId = null
+      }
+      this.sendToRenderer('ble:connection-state', {
+        connected: false,
+        deviceId,
+        reason: ctx.error || undefined
+      })
+    }
+
+    // Handle device lost
+    if (newState === 'lost') {
+      this.deviceFSMs.delete(deviceId)
+      this.sendToRenderer('ble:device-lost', { deviceId })
     }
   }
 
@@ -107,6 +144,34 @@ export class BleService {
       this.mainWindow.webContents.send(channel, data)
     }
   }
+
+  // ==================== Device Presence Check ====================
+
+  private startDevicePresenceCheck(): void {
+    if (this.deviceCheckTimer) return
+
+    this.deviceCheckTimer = setInterval(() => {
+      for (const [deviceId, fsm] of this.deviceFSMs) {
+        // Only check devices that are in discovered state
+        if (fsm.matches('discovered') && fsm.isStale(DEVICE_LOST_TIMEOUT)) {
+          console.log(`[BLE] Device ${deviceId} is stale, marking as lost`)
+          fsm.markLost()
+        }
+      }
+    }, DEVICE_CHECK_INTERVAL)
+
+    console.log('[BLE] Device presence check started')
+  }
+
+  private stopDevicePresenceCheck(): void {
+    if (this.deviceCheckTimer) {
+      clearInterval(this.deviceCheckTimer)
+      this.deviceCheckTimer = null
+      console.log('[BLE] Device presence check stopped')
+    }
+  }
+
+  // ==================== Public API ====================
 
   getState(): string {
     return noble.state
@@ -125,16 +190,19 @@ export class BleService {
         return { success: true }
       }
 
-      await noble.startScanningAsync([], true) // Allow duplicates to update RSSI
+      // Clear old FSMs
+      this.deviceFSMs.clear()
+
+      await noble.startScanningAsync([], true)
       this.isScanning = true
 
-      // Start monitoring for disappeared devices
+      // Start device presence monitoring
       this.startDevicePresenceCheck()
 
-      console.log('BLE scanning started')
+      console.log('[BLE] Scanning started')
       return { success: true }
     } catch (error) {
-      console.error('Failed to start scanning:', error)
+      console.error('[BLE] Failed to start scanning:', error)
       return { success: false, error: String(error) }
     }
   }
@@ -144,207 +212,104 @@ export class BleService {
       if (this.isScanning) {
         await noble.stopScanningAsync()
         this.isScanning = false
-
-        // Stop device presence monitoring
         this.stopDevicePresenceCheck()
-
-        console.log('BLE scanning stopped')
+        console.log('[BLE] Scanning stopped')
       }
       return { success: true }
     } catch (error) {
-      console.error('Failed to stop scanning:', error)
+      console.error('[BLE] Failed to stop scanning:', error)
       return { success: false }
     }
   }
 
   async connectAndGetBattery(deviceId: string): Promise<BatteryResult> {
-    const peripheral = this.discoveredPeripherals.get(deviceId)
+    const fsm = this.deviceFSMs.get(deviceId)
 
-    if (!peripheral) {
+    if (!fsm) {
       return { success: false, error: 'Device not found. Please scan first.' }
     }
 
-    // If already connected to this device, just read battery
-    if (this.connectedPeripheral && this.connectedDeviceId === deviceId) {
-      return this.readBatteryLevel(this.connectedPeripheral)
-    }
-
-    // Disconnect from previous device if connected
-    if (this.connectedPeripheral) {
-      await this.disconnect()
-    }
-
-    // Stop scanning before connecting (required by noble)
+    // Stop scanning before connecting
     if (this.isScanning) {
       await this.stopScan()
     }
 
-    try {
-      console.log(`Connecting to device: ${peripheral.advertisement.localName || deviceId}`)
-
-      // Connect to the peripheral
-      await peripheral.connectAsync()
-      console.log('Connected successfully')
-
-      // Store connected peripheral reference
-      this.connectedPeripheral = peripheral
-      this.connectedDeviceId = deviceId
-
-      // Setup disconnect listener for auto-disconnect detection
-      this.setupDisconnectListener(peripheral, deviceId)
-
-      // Notify renderer about connection state
-      this.sendToRenderer('ble:connection-state', { connected: true, deviceId })
-
-      // Read battery level
-      return await this.readBatteryLevel(peripheral)
-    } catch (error) {
-      console.error('Failed to connect:', error)
-      this.connectedPeripheral = null
-      this.connectedDeviceId = null
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error)
+    // If already connected, just read battery
+    if (fsm.matches('connected')) {
+      const readSuccess = await fsm.readBattery()
+      if (readSuccess) {
+        const ctx = fsm.getContext()
+        return { success: true, level: ctx.batteryLevel ?? undefined }
       }
-    }
-  }
-
-  private async readBatteryLevel(peripheral: Peripheral): Promise<BatteryResult> {
-    try {
-      // Discover battery service and characteristic
-      console.log('Discovering battery service...')
-      const { characteristics } = await peripheral.discoverSomeServicesAndCharacteristicsAsync(
-        [BATTERY_SERVICE_UUID],
-        [BATTERY_LEVEL_CHARACTERISTIC_UUID]
-      )
-
-      if (characteristics.length === 0) {
-        return {
-          success: false,
-          error: 'Battery service not found on this device'
-        }
-      }
-
-      const batteryCharacteristic = characteristics.find(
-        (c) => c.uuid === BATTERY_LEVEL_CHARACTERISTIC_UUID
-      )
-
-      if (!batteryCharacteristic) {
-        return {
-          success: false,
-          error: 'Battery level characteristic not found'
-        }
-      }
-
-      // Read battery level
-      console.log('Reading battery level...')
-      const data = await batteryCharacteristic.readAsync()
-      const batteryLevel = data[0] // Battery level is a single byte (0-100)
-
-      console.log(`Battery level: ${batteryLevel}%`)
-
-      return { success: true, level: batteryLevel }
-    } catch (error) {
-      console.error('Failed to read battery level:', error)
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error)
-      }
-    }
-  }
-
-  // Setup listener for device auto-disconnect (e.g., device powered off, out of range)
-  private setupDisconnectListener(peripheral: Peripheral, deviceId: string): void {
-    // Remove any existing listener first
-    this.removeDisconnectListener()
-
-    // Create the disconnect handler
-    this.disconnectHandler = (reason: string) => {
-      console.log(`Device disconnected automatically. Reason: ${reason}`)
-
-      // Clean up state
-      this.connectedPeripheral = null
-      this.connectedDeviceId = null
-      this.disconnectHandler = null
-
-      // Notify renderer about auto-disconnection
-      this.sendToRenderer('ble:connection-state', {
-        connected: false,
-        deviceId,
-        reason // Include disconnect reason
-      })
+      return { success: false, error: 'Failed to read battery' }
     }
 
-    // Register the listener
-    peripheral.on('disconnect', this.disconnectHandler)
-    console.log('Disconnect listener registered')
-  }
+    // Connect (this will auto-read battery for SP51A)
+    const connectSuccess = await fsm.connect()
+    if (!connectSuccess) {
+      const ctx = fsm.getContext()
+      return { success: false, error: ctx.error || 'Connection failed' }
+    }
 
-  // Remove disconnect listener from peripheral
-  private removeDisconnectListener(): void {
-    if (this.connectedPeripheral && this.disconnectHandler) {
-      this.connectedPeripheral.removeListener('disconnect', this.disconnectHandler)
-      this.disconnectHandler = null
-      console.log('Disconnect listener removed')
+    // Wait a bit for battery read to complete
+    await new Promise((resolve) => setTimeout(resolve, 500))
+
+    const ctx = fsm.getContext()
+    return {
+      success: ctx.batteryLevel !== null,
+      level: ctx.batteryLevel ?? undefined,
+      error: ctx.batteryLevel === null ? 'Battery read failed' : undefined
     }
   }
 
   async disconnect(): Promise<{ success: boolean; error?: string }> {
-    if (!this.connectedPeripheral) {
-      return { success: true } // Already disconnected
+    if (!this.activeDeviceId) {
+      return { success: true }
     }
 
-    try {
-      console.log('Disconnecting from device...')
-
-      // Remove listener before manual disconnect to avoid duplicate notifications
-      this.removeDisconnectListener()
-
-      await this.connectedPeripheral.disconnectAsync()
-      console.log('Disconnected successfully')
-
-      const deviceId = this.connectedDeviceId
-      this.connectedPeripheral = null
-      this.connectedDeviceId = null
-
-      // Notify renderer about disconnection
-      this.sendToRenderer('ble:connection-state', { connected: false, deviceId })
-
+    const fsm = this.deviceFSMs.get(this.activeDeviceId)
+    if (!fsm) {
       return { success: true }
-    } catch (error) {
-      console.error('Failed to disconnect:', error)
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error)
-      }
+    }
+
+    const success = await fsm.disconnect()
+    return {
+      success,
+      error: success ? undefined : fsm.getContext().error || 'Disconnect failed'
     }
   }
 
   getConnectedDeviceId(): string | null {
-    return this.connectedDeviceId
+    return this.activeDeviceId
   }
 
   isConnected(): boolean {
-    return this.connectedPeripheral !== null
+    return this.activeDeviceId !== null
+  }
+
+  /**
+   * Get FSM for a device (for advanced usage)
+   */
+  getDeviceFSM(deviceId: string): BleDeviceFSM | undefined {
+    return this.deviceFSMs.get(deviceId)
   }
 
   cleanup(): void {
-    // Stop device presence check
     this.stopDevicePresenceCheck()
 
-    // Remove disconnect listener first
-    this.removeDisconnectListener()
-
-    if (this.connectedPeripheral) {
-      this.connectedPeripheral.disconnect()
-      this.connectedPeripheral = null
-      this.connectedDeviceId = null
+    // Disconnect all devices
+    for (const fsm of this.deviceFSMs.values()) {
+      if (fsm.matches('connected')) {
+        fsm.disconnect()
+      }
     }
+
+    this.deviceFSMs.clear()
+    this.activeDeviceId = null
+
     if (this.isScanning) {
       noble.stopScanning()
       this.isScanning = false
     }
-    this.discoveredPeripherals.clear()
-    this.deviceLastSeen.clear()
   }
 }
