@@ -46,8 +46,24 @@ export const BATTERY_LEVEL_CHARACTERISTIC_UUID = '2a19'
  * Base class for BLE device state machines
  * Override hook methods in subclass for device-specific behavior
  */
+// 心跳检测间隔（毫秒）
+const HEARTBEAT_INTERVAL = 5000
+// 连接检测超时（毫秒）
+const CONNECTION_CHECK_TIMEOUT = 3000
+
+/**
+ * Why we don't use peripheral.on('disconnect') event:
+ *
+ * On Windows, @stoprocent/noble uses WinRT as the BLE backend.
+ * The disconnect event relies on Supervision Timeout, which can take 20-30 seconds
+ * to trigger after a device suddenly loses power (e.g., battery removed).
+ * In some cases, the event may never fire at all.
+ *
+ * Instead, we use a heartbeat mechanism that actively checks the connection
+ * status every few seconds, providing faster and more reliable disconnect detection.
+ */
 export abstract class BleDeviceFSM extends AsyncStateMachine<BleDeviceState, BleDeviceContext> {
-  private disconnectHandler: ((reason: string) => void) | null = null
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
 
   constructor(deviceId?: string) {
     super('idle', {
@@ -79,7 +95,7 @@ export abstract class BleDeviceFSM extends AsyncStateMachine<BleDeviceState, Ble
       },
       connected: {
         [BleEvents.DISCONNECT]: 'disconnecting',
-        [BleEvents.AUTO_DISCONNECT]: 'discovered'
+        [BleEvents.AUTO_DISCONNECT]: 'lost'
       },
       disconnecting: {
         [BleEvents.DISCONNECT_DONE]: 'idle'
@@ -165,9 +181,6 @@ export abstract class BleDeviceFSM extends AsyncStateMachine<BleDeviceState, Ble
       await ctx.peripheral!.connectAsync()
       console.log(`[BLE] Connected to ${ctx.deviceName}`)
 
-      // Setup disconnect listener
-      this.setupDisconnectListener(ctx)
-
       // Trigger success event
       await this.send(BleEvents.CONNECT_SUCCESS)
     } catch (error) {
@@ -183,14 +196,16 @@ export abstract class BleDeviceFSM extends AsyncStateMachine<BleDeviceState, Ble
    */
   protected async onConnectedEntry(ctx: BleDeviceContext, _event: string): Promise<void> {
     console.log(`[BLE] Now connected to ${ctx.deviceName}`)
+    // Start heartbeat to detect disconnection (workaround for Windows)
+    this.startHeartbeat(ctx)
   }
 
   /**
    * Called when leaving connected state
    * Override to add cleanup logic
    */
-  protected async onConnectedExit(ctx: BleDeviceContext): Promise<void> {
-    this.removeDisconnectListener(ctx)
+  protected async onConnectedExit(_ctx: BleDeviceContext): Promise<void> {
+    this.stopHeartbeat()
   }
 
   /**
@@ -248,26 +263,59 @@ export abstract class BleDeviceFSM extends AsyncStateMachine<BleDeviceState, Ble
   }
 
   /**
-   * Setup auto-disconnect listener
+   * Start heartbeat check for connection status
    */
-  private setupDisconnectListener(ctx: BleDeviceContext): void {
-    this.removeDisconnectListener(ctx)
+  private startHeartbeat(ctx: BleDeviceContext): void {
+    this.stopHeartbeat()
 
-    this.disconnectHandler = (reason: string) => {
-      console.log(`[BLE] Auto-disconnected: ${reason}`)
-      this.send(BleEvents.AUTO_DISCONNECT, { reason })
-    }
+    console.log(`[BLE] Starting heartbeat check (interval: ${HEARTBEAT_INTERVAL}ms)`)
 
-    ctx.peripheral?.on('disconnect', this.disconnectHandler)
+    this.heartbeatTimer = setInterval(async () => {
+      if (this.getState() !== 'connected' || !ctx.peripheral) {
+        this.stopHeartbeat()
+        return
+      }
+
+      try {
+        // Check peripheral state
+        const state = ctx.peripheral.state
+        console.log(`[BLE] Heartbeat: peripheral state = ${state}`)
+
+        if (state === 'disconnected' || state === 'error') {
+          console.log(`[BLE] Heartbeat detected disconnect (state: ${state})`)
+          this.stopHeartbeat()
+          await this.send(BleEvents.AUTO_DISCONNECT, { reason: `heartbeat_detected_${state}` })
+          return
+        }
+
+        // Try to discover services as a connection check
+        // If it fails, the connection is likely lost
+        await Promise.race([
+          ctx.peripheral.discoverServicesAsync(),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error('DiscoverServices timeout')),
+              CONNECTION_CHECK_TIMEOUT
+            )
+          )
+        ])
+        console.log(`[BLE] Heartbeat: connection OK`)
+      } catch (error) {
+        console.log(`[BLE] Heartbeat check failed:`, error)
+        this.stopHeartbeat()
+        await this.send(BleEvents.AUTO_DISCONNECT, { reason: 'heartbeat_failed' })
+      }
+    }, HEARTBEAT_INTERVAL)
   }
 
   /**
-   * Remove disconnect listener
+   * Stop heartbeat check
    */
-  private removeDisconnectListener(ctx: BleDeviceContext): void {
-    if (this.disconnectHandler && ctx.peripheral) {
-      ctx.peripheral.removeListener('disconnect', this.disconnectHandler)
-      this.disconnectHandler = null
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+      console.log(`[BLE] Heartbeat stopped`)
     }
   }
 
